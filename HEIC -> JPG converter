@@ -1,0 +1,38 @@
+# HEIC -> JPG converter
+# Input folder:  D:\Photos-3-001
+# Output folder: D:\Photos-3-001  (same location)
+
+from pathlib import Path
+from PIL import Image
+import pillow_heif
+
+# register HEIC support
+pillow_heif.register_heif_opener()
+
+# source folder
+SOURCE_DIR = Path(r"D:\Photos-3-001")
+
+# convert all HEIC files in folder
+converted = 0
+failed = 0
+
+for file in SOURCE_DIR.glob("*.heic"):
+    try:
+        output_file = file.with_suffix(".jpg")
+
+        with Image.open(file) as img:
+            rgb = img.convert("RGB")
+            rgb.save(output_file, "JPEG", quality=95, optimize=True)
+
+        print(f"OK: {file.name} -> {output_file.name}")
+        converted += 1
+
+    except Exception as e:
+        print(f"ERROR: {file.name} -> {e}")
+        failed += 1
+
+print("\nDone")
+print(f"Converted: {converted}")
+print(f"Failed: {failed}")
+
+
