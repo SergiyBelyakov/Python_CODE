@@ -1,0 +1,24 @@
+import pandas as pd
+import googlemaps
+#open distination file
+data = pd.read_excel(r'C:\Users\sergi\Desktop\INPUT.xlsx')
+#choose column with adresses 'Adress'
+df = pd.DataFrame(data, columns = ['Find'])
+#use Google API
+gmaps_key = googlemaps.Client(key = "AIzaSyBN0AQND9CHMPXuMdmTtI0l5MA4lX7ZnCo")
+df['Lat'] = None
+df['Lon'] = None
+#find lat and lng for adresses
+for i in range(len(df)):
+    geocode_result = gmaps_key.geocode(df.loc[i,'Find'])
+    try:
+        lat = geocode_result[0]["geometry"]["location"]["lat"]
+        lng = geocode_result[0]["geometry"]["location"]["lng"]
+        df.loc[i,'Lat'] = lat
+        df.loc[i,'Lon'] = lng
+    except:
+        lat = None
+        lng = None
+#export data to csv
+df.to_csv(r'C:\Users\sergi\Desktop\OUTPUT.csv')
+print("Done!Yahoo!")
