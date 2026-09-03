@@ -1,0 +1,103 @@
+from pathlib import Path
+import pandas as pd
+import csv
+
+# Встав сюди шлях до папки з CSV
+INPUT_FOLDER = Path(r"C:\Users\YourName\Downloads\csv_files")
+
+# XLSX-файли будуть створені в окремій папці
+OUTPUT_FOLDER = INPUT_FOLDER / "xlsx"
+OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+
+def detect_encoding(file_path):
+    encodings = [
+        "utf-8-sig",
+        "utf-8",
+        "cp1251",
+        "windows-1251",
+        "latin1"
+    ]
+
+    for encoding in encodings:
+        try:
+            with open(file_path, "r", encoding=encoding) as f:
+                f.read(10000)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+
+    return "latin1"
+
+
+def detect_separator(file_path, encoding):
+    try:
+        with open(file_path, "r", encoding=encoding, errors="replace") as f:
+            sample = f.read(10000)
+
+        dialect = csv.Sniffer().sniff(
+            sample,
+            delimiters=";,\t|"
+        )
+
+        return dialect.delimiter
+
+    except Exception:
+        return ";"
+
+
+def convert_csv_to_xlsx(csv_file):
+    encoding = detect_encoding(csv_file)
+    separator = detect_separator(csv_file, encoding)
+
+    print(f"\nОбробка: {csv_file.name}")
+    print(f"Кодування: {encoding}")
+    print(f"Роздільник: {repr(separator)}")
+
+    try:
+        df = pd.read_csv(
+            csv_file,
+            sep=separator,
+            encoding=encoding,
+            dtype=str,
+            keep_default_na=False,
+            low_memory=False
+        )
+
+        output_file = OUTPUT_FOLDER / f"{csv_file.stem}.xlsx"
+
+        df.to_excel(
+            output_file,
+            index=False,
+            engine="openpyxl"
+        )
+
+        print(f"OK: {output_file}")
+
+    except Exception as e:
+        print(f"ПОМИЛКА: {csv_file.name}")
+        print(e)
+
+
+def main():
+    csv_files = list(INPUT_FOLDER.glob("*.csv"))
+
+    if not csv_files:
+        print("CSV-файли не знайдені:")
+        print(INPUT_FOLDER)
+        input("\nНатисніть Enter для виходу...")
+        return
+
+    print(f"Знайдено CSV-файлів: {len(csv_files)}")
+
+    for csv_file in csv_files:
+        convert_csv_to_xlsx(csv_file)
+
+    print("\nГОТОВО")
+    print(f"Результат: {OUTPUT_FOLDER}")
+
+    input("\nНатисніть Enter для виходу...")
+
+
+if __name__ == "__main__":
+    main()
