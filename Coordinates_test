@@ -1,0 +1,1110 @@
+import os
+import re
+import json
+import time
+import math
+import sqlite3
+import hashlib
+from pathlib import Path
+from difflib import SequenceMatcher
+
+import pandas as pd
+import requests
+
+
+# ============================================================
+# НАЛАШТУВАННЯ
+# ============================================================
+
+INPUT_FILE = Path(r"C:\geocoding\addresses.xlsx")
+OUTPUT_FILE = Path(r"C:\geocoding\geocoding_results.xlsx")
+
+# Назва колонки з адресою
+ADDRESS_COLUMN = "address"
+
+# Якщо у тестових даних є правильні координати
+REFERENCE_LAT_COLUMN = "ref_lat"
+REFERENCE_LON_COLUMN = "ref_lon"
+
+# Україна
+COUNTRY_ISO2 = "UA"
+COUNTRY_ISO3 = "UKR"
+LANGUAGE = "uk"
+
+# API ключі.
+# Краще задавати через environment variables.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
+HERE_API_KEY = os.getenv("HERE_API_KEY", "")
+
+# Nominatim не потребує API key.
+# Публічний сервер має обмеження використання.
+USE_NOMINATIM = True
+
+# User-Agent обов'язковий для Nominatim
+NOMINATIM_USER_AGENT = "address-geocoder-validation/1.0 contact@example.com"
+
+# Пороги консенсусу
+STRONG_DISTANCE_M = 100
+MEDIUM_DISTANCE_M = 250
+OUTLIER_DISTANCE_M = 1000
+
+# SQLite cache
+CACHE_FILE = Path("geocoding_cache.sqlite")
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": NOMINATIM_USER_AGENT
+})
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
+def init_cache():
+    conn = sqlite3.connect(CACHE_FILE)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS geocode_cache (
+            cache_key TEXT PRIMARY KEY,
+            provider TEXT,
+            address TEXT,
+            response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def cache_key(provider, address):
+    value = f"{provider}|{address}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def cache_get(provider, address):
+    key = cache_key(provider, address)
+
+    conn = sqlite3.connect(CACHE_FILE)
+
+    row = conn.execute(
+        "SELECT response FROM geocode_cache WHERE cache_key = ?",
+        (key,)
+    ).fetchone()
+
+    conn.close()
+
+    if row:
+        return json.loads(row[0])
+
+    return None
+
+
+def cache_set(provider, address, result):
+    key = cache_key(provider, address)
+
+    conn = sqlite3.connect(CACHE_FILE)
+
+    conn.execute("""
+        INSERT OR REPLACE INTO geocode_cache
+        (cache_key, provider, address, response)
+        VALUES (?, ?, ?, ?)
+    """, (
+        key,
+        provider,
+        address,
+        json.dumps(result, ensure_ascii=False)
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# НОРМАЛІЗАЦІЯ АДРЕС
+# ============================================================
+
+def normalize_address(address):
+    if pd.isna(address):
+        return ""
+
+    address = str(address).strip()
+
+    replacements = {
+        r"\bвул\.\s*": "вулиця ",
+        r"\bвул\s+": "вулиця ",
+        r"\bпросп\.\s*": "проспект ",
+        r"\bпр-т\s+": "проспект ",
+        r"\bпров\.\s*": "провулок ",
+        r"\bбул\.\s*": "бульвар ",
+        r"\bобл\.\s*": "область ",
+        r"\bр-н\b": "район",
+    }
+
+    for pattern, replacement in replacements.items():
+        address = re.sub(
+            pattern,
+            replacement,
+            address,
+            flags=re.IGNORECASE
+        )
+
+    address = re.sub(r"\s+", " ", address)
+    address = re.sub(r"\s*,\s*", ", ", address)
+
+    return address.strip(" ,")
+
+
+def normalize_for_comparison(text):
+    if not text:
+        return ""
+
+    text = str(text).lower()
+
+    text = re.sub(
+        r"[^\wа-яіїєґА-ЯІЇЄҐ0-9]+",
+        " ",
+        text
+    )
+
+    return " ".join(text.split())
+
+
+def address_similarity(a, b):
+    a = normalize_for_comparison(a)
+    b = normalize_for_comparison(b)
+
+    if not a or not b:
+        return None
+
+    return round(
+        SequenceMatcher(None, a, b).ratio() * 100,
+        2
+    )
+
+
+# ============================================================
+# GEO DISTANCE
+# ============================================================
+
+def haversine(lat1, lon1, lat2, lon2):
+    """
+    Відстань між двома координатами у метрах.
+    """
+
+    R = 6371000
+
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(d_phi / 2) ** 2
+        + math.cos(phi1)
+        * math.cos(phi2)
+        * math.sin(d_lambda / 2) ** 2
+    )
+
+    c = 2 * math.atan2(
+        math.sqrt(a),
+        math.sqrt(1 - a)
+    )
+
+    return R * c
+
+
+# ============================================================
+# GOOGLE
+# ============================================================
+
+def geocode_google(address):
+
+    if not GOOGLE_API_KEY:
+        return {
+            "provider": "google",
+            "status": "NO_API_KEY"
+        }
+
+    provider = "google"
+
+    cached = cache_get(provider, address)
+
+    if cached:
+        return cached
+
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+
+    params = {
+        "address": address,
+        "key": GOOGLE_API_KEY,
+        "language": LANGUAGE,
+        "region": COUNTRY_ISO2.lower()
+    }
+
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=20
+        )
+
+        data = response.json()
+
+        if (
+            data.get("status") != "OK"
+            or not data.get("results")
+        ):
+            result = {
+                "provider": provider,
+                "status": data.get("status", "NO_RESULT")
+            }
+
+            cache_set(provider, address, result)
+            return result
+
+        item = data["results"][0]
+
+        location = item["geometry"]["location"]
+
+        result = {
+            "provider": provider,
+            "status": "OK",
+            "lat": float(location["lat"]),
+            "lon": float(location["lng"]),
+            "matched_address": item.get(
+                "formatted_address"
+            ),
+            "precision": item.get(
+                "geometry", {}
+            ).get(
+                "location_type"
+            ),
+            "partial_match": item.get(
+                "partial_match",
+                False
+            )
+        }
+
+        cache_set(provider, address, result)
+
+        return result
+
+    except Exception as e:
+        return {
+            "provider": provider,
+            "status": "ERROR",
+            "error": str(e)
+        }
+
+
+# ============================================================
+# MAPBOX
+# ============================================================
+
+def geocode_mapbox(address):
+
+    if not MAPBOX_TOKEN:
+        return {
+            "provider": "mapbox",
+            "status": "NO_API_KEY"
+        }
+
+    provider = "mapbox"
+
+    cached = cache_get(provider, address)
+
+    if cached:
+        return cached
+
+    url = (
+        "https://api.mapbox.com/"
+        "search/geocode/v6/forward"
+    )
+
+    params = {
+        "q": address,
+        "access_token": MAPBOX_TOKEN,
+        "country": COUNTRY_ISO2,
+        "language": LANGUAGE,
+        "autocomplete": "false",
+        "limit": 1
+    }
+
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=20
+        )
+
+        data = response.json()
+
+        features = data.get("features", [])
+
+        if not features:
+            result = {
+                "provider": provider,
+                "status": "NO_RESULT"
+            }
+
+            cache_set(provider, address, result)
+            return result
+
+        feature = features[0]
+
+        coordinates = feature["geometry"]["coordinates"]
+
+        properties = feature.get("properties", {})
+
+        match_code = properties.get(
+            "match_code",
+            {}
+        )
+
+        full_address = (
+            properties.get("full_address")
+            or (
+                str(properties.get("name", ""))
+                + ", "
+                + str(properties.get(
+                    "place_formatted",
+                    ""
+                ))
+            ).strip(", ")
+        )
+
+        result = {
+            "provider": provider,
+            "status": "OK",
+            "lat": float(coordinates[1]),
+            "lon": float(coordinates[0]),
+            "matched_address": full_address,
+            "precision": properties.get(
+                "coordinates", {}
+            ).get("accuracy"),
+            "confidence": match_code.get(
+                "confidence"
+            ),
+            "feature_type": properties.get(
+                "feature_type"
+            )
+        }
+
+        cache_set(provider, address, result)
+
+        return result
+
+    except Exception as e:
+        return {
+            "provider": provider,
+            "status": "ERROR",
+            "error": str(e)
+        }
+
+
+# ============================================================
+# HERE
+# ============================================================
+
+def geocode_here(address):
+
+    if not HERE_API_KEY:
+        return {
+            "provider": "here",
+            "status": "NO_API_KEY"
+        }
+
+    provider = "here"
+
+    cached = cache_get(provider, address)
+
+    if cached:
+        return cached
+
+    url = (
+        "https://geocode.search.hereapi.com/"
+        "v1/geocode"
+    )
+
+    params = {
+        "q": address,
+        "apiKey": HERE_API_KEY,
+        "lang": LANGUAGE,
+        "in": f"countryCode:{COUNTRY_ISO3}",
+        "limit": 1
+    }
+
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=20
+        )
+
+        data = response.json()
+
+        items = data.get("items", [])
+
+        if not items:
+            result = {
+                "provider": provider,
+                "status": "NO_RESULT"
+            }
+
+            cache_set(provider, address, result)
+            return result
+
+        item = items[0]
+
+        position = item.get("position", {})
+
+        scoring = item.get("scoring", {})
+
+        result = {
+            "provider": provider,
+            "status": "OK",
+            "lat": float(position["lat"]),
+            "lon": float(position["lng"]),
+            "matched_address": item.get("title"),
+            "precision": item.get(
+                "resultType"
+            ),
+            "confidence": scoring.get(
+                "queryScore"
+            )
+        }
+
+        cache_set(provider, address, result)
+
+        return result
+
+    except Exception as e:
+        return {
+            "provider": provider,
+            "status": "ERROR",
+            "error": str(e)
+        }
+
+
+# ============================================================
+# NOMINATIM / OPENSTREETMAP
+# ============================================================
+
+def geocode_nominatim(address):
+
+    provider = "nominatim"
+
+    cached = cache_get(provider, address)
+
+    if cached:
+        return cached
+
+    url = (
+        "https://nominatim.openstreetmap.org/"
+        "search"
+    )
+
+    params = {
+        "q": address,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "limit": 1,
+        "countrycodes": COUNTRY_ISO2.lower(),
+        "accept-language": LANGUAGE
+    }
+
+    try:
+
+        # Публічна політика Nominatim:
+        # максимум 1 request / second.
+        time.sleep(1.1)
+
+        response = session.get(
+            url,
+            params=params,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data:
+            result = {
+                "provider": provider,
+                "status": "NO_RESULT"
+            }
+
+            cache_set(provider, address, result)
+
+            return result
+
+        item = data[0]
+
+        result = {
+            "provider": provider,
+            "status": "OK",
+            "lat": float(item["lat"]),
+            "lon": float(item["lon"]),
+            "matched_address": item.get(
+                "display_name"
+            ),
+            "precision": (
+                item.get("addresstype")
+                or item.get("type")
+            ),
+            "confidence": item.get(
+                "importance"
+            )
+        }
+
+        cache_set(provider, address, result)
+
+        return result
+
+    except Exception as e:
+        return {
+            "provider": provider,
+            "status": "ERROR",
+            "error": str(e)
+        }
+
+
+# ============================================================
+# CONSENSUS
+# ============================================================
+
+def calculate_consensus(results):
+
+    valid = [
+        x for x in results
+        if x.get("status") == "OK"
+        and x.get("lat") is not None
+        and x.get("lon") is not None
+    ]
+
+    if not valid:
+        return {
+            "consensus_provider": None,
+            "consensus_lat": None,
+            "consensus_lon": None,
+            "agreement": "NO_RESULT",
+            "support_count": 0,
+            "provider_count": 0,
+            "max_distance_m": None
+        }
+
+    if len(valid) == 1:
+
+        point = valid[0]
+
+        return {
+            "consensus_provider": point["provider"],
+            "consensus_lat": point["lat"],
+            "consensus_lon": point["lon"],
+            "agreement": "SINGLE_PROVIDER",
+            "support_count": 1,
+            "provider_count": 1,
+            "max_distance_m": None
+        }
+
+    scores = {}
+
+    for candidate in valid:
+
+        distances = []
+
+        for other in valid:
+
+            if candidate["provider"] == other["provider"]:
+                continue
+
+            d = haversine(
+                candidate["lat"],
+                candidate["lon"],
+                other["lat"],
+                other["lon"]
+            )
+
+            distances.append(d)
+
+        scores[candidate["provider"]] = (
+            sum(distances) / len(distances)
+        )
+
+    # Medoid
+    best_provider = min(
+        scores,
+        key=scores.get
+    )
+
+    best = next(
+        x for x in valid
+        if x["provider"] == best_provider
+    )
+
+    distances_from_best = []
+
+    support = 0
+
+    for item in valid:
+
+        d = haversine(
+            best["lat"],
+            best["lon"],
+            item["lat"],
+            item["lon"]
+        )
+
+        distances_from_best.append(d)
+
+        if d <= STRONG_DISTANCE_M:
+            support += 1
+
+    max_distance = max(distances_from_best)
+
+    ratio = support / len(valid)
+
+    if (
+        len(valid) >= 3
+        and ratio >= 0.75
+    ):
+        agreement = "HIGH"
+
+    elif (
+        len(valid) >= 2
+        and max_distance <= MEDIUM_DISTANCE_M
+    ):
+        agreement = "MEDIUM"
+
+    else:
+        agreement = "LOW"
+
+    return {
+        "consensus_provider": best_provider,
+        "consensus_lat": best["lat"],
+        "consensus_lon": best["lon"],
+        "agreement": agreement,
+        "support_count": support,
+        "provider_count": len(valid),
+        "max_distance_m": round(
+            max_distance,
+            2
+        )
+    }
+
+
+# ============================================================
+# ОБРОБКА ОДНІЄЇ АДРЕСИ
+# ============================================================
+
+def process_address(address, ref_lat=None, ref_lon=None):
+
+    normalized = normalize_address(address)
+
+    results = [
+        geocode_google(normalized),
+        geocode_here(normalized),
+        geocode_mapbox(normalized)
+    ]
+
+    if USE_NOMINATIM:
+        results.append(
+            geocode_nominatim(normalized)
+        )
+
+    consensus = calculate_consensus(results)
+
+    row = {
+        "address_original": address,
+        "address_normalized": normalized
+    }
+
+    # --------------------------------------------------------
+    # PROVIDER RESULTS
+    # --------------------------------------------------------
+
+    for result in results:
+
+        provider = result["provider"]
+
+        row[f"{provider}_status"] = result.get(
+            "status"
+        )
+
+        row[f"{provider}_lat"] = result.get(
+            "lat"
+        )
+
+        row[f"{provider}_lon"] = result.get(
+            "lon"
+        )
+
+        row[f"{provider}_address"] = result.get(
+            "matched_address"
+        )
+
+        row[f"{provider}_precision"] = result.get(
+            "precision"
+        )
+
+        row[f"{provider}_confidence"] = result.get(
+            "confidence"
+        )
+
+        row[f"{provider}_address_similarity"] = (
+            address_similarity(
+                normalized,
+                result.get("matched_address")
+            )
+        )
+
+    # --------------------------------------------------------
+    # DISTANCE TO CONSENSUS
+    # --------------------------------------------------------
+
+    if consensus["consensus_lat"] is not None:
+
+        for result in results:
+
+            if result.get("status") == "OK":
+
+                distance = haversine(
+                    result["lat"],
+                    result["lon"],
+                    consensus["consensus_lat"],
+                    consensus["consensus_lon"]
+                )
+
+                row[
+                    f"{result['provider']}_consensus_distance_m"
+                ] = round(distance, 2)
+
+                row[
+                    f"{result['provider']}_outlier"
+                ] = (
+                    distance > OUTLIER_DISTANCE_M
+                )
+
+    # --------------------------------------------------------
+    # GROUND TRUTH
+    # --------------------------------------------------------
+
+    has_reference = (
+        ref_lat is not None
+        and ref_lon is not None
+        and not pd.isna(ref_lat)
+        and not pd.isna(ref_lon)
+    )
+
+    if has_reference:
+
+        ref_lat = float(ref_lat)
+        ref_lon = float(ref_lon)
+
+        row["ref_lat"] = ref_lat
+        row["ref_lon"] = ref_lon
+
+        for result in results:
+
+            if result.get("status") == "OK":
+
+                error = haversine(
+                    result["lat"],
+                    result["lon"],
+                    ref_lat,
+                    ref_lon
+                )
+
+                row[
+                    f"{result['provider']}_error_m"
+                ] = round(error, 2)
+
+    row.update(consensus)
+
+    return row
+
+
+# ============================================================
+# PROVIDER BENCHMARK
+# ============================================================
+
+def create_provider_summary(df):
+
+    providers = [
+        "google",
+        "here",
+        "mapbox",
+        "nominatim"
+    ]
+
+    rows = []
+
+    for provider in providers:
+
+        status_column = f"{provider}_status"
+
+        if status_column not in df.columns:
+            continue
+
+        total = len(df)
+
+        successful = (
+            df[status_column] == "OK"
+        ).sum()
+
+        summary = {
+            "provider": provider,
+            "total_addresses": total,
+            "successful": successful,
+            "success_rate_pct": round(
+                successful / total * 100,
+                2
+            ) if total else 0
+        }
+
+        consensus_column = (
+            f"{provider}_consensus_distance_m"
+        )
+
+        if consensus_column in df.columns:
+
+            values = pd.to_numeric(
+                df[consensus_column],
+                errors="coerce"
+            ).dropna()
+
+            if not values.empty:
+
+                summary[
+                    "median_consensus_distance_m"
+                ] = round(values.median(), 2)
+
+                summary[
+                    "mean_consensus_distance_m"
+                ] = round(values.mean(), 2)
+
+        error_column = f"{provider}_error_m"
+
+        if error_column in df.columns:
+
+            errors = pd.to_numeric(
+                df[error_column],
+                errors="coerce"
+            ).dropna()
+
+            if not errors.empty:
+
+                summary["median_error_m"] = round(
+                    errors.median(),
+                    2
+                )
+
+                summary["mean_error_m"] = round(
+                    errors.mean(),
+                    2
+                )
+
+                summary["p90_error_m"] = round(
+                    errors.quantile(0.90),
+                    2
+                )
+
+                summary["within_25m_pct"] = round(
+                    (errors <= 25).mean() * 100,
+                    2
+                )
+
+                summary["within_50m_pct"] = round(
+                    (errors <= 50).mean() * 100,
+                    2
+                )
+
+                summary["within_100m_pct"] = round(
+                    (errors <= 100).mean() * 100,
+                    2
+                )
+
+                summary["within_250m_pct"] = round(
+                    (errors <= 250).mean() * 100,
+                    2
+                )
+
+        rows.append(summary)
+
+    summary_df = pd.DataFrame(rows)
+
+    if "median_error_m" in summary_df.columns:
+
+        summary_df = summary_df.sort_values(
+            [
+                "median_error_m",
+                "success_rate_pct"
+            ],
+            ascending=[True, False]
+        )
+
+    elif (
+        "median_consensus_distance_m"
+        in summary_df.columns
+    ):
+
+        summary_df = summary_df.sort_values(
+            [
+                "median_consensus_distance_m",
+                "success_rate_pct"
+            ],
+            ascending=[True, False]
+        )
+
+    return summary_df
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    init_cache()
+
+    print("Читання:", INPUT_FILE)
+
+    if INPUT_FILE.suffix.lower() == ".csv":
+
+        df = pd.read_csv(
+            INPUT_FILE,
+            dtype=str
+        )
+
+    else:
+
+        df = pd.read_excel(
+            INPUT_FILE
+        )
+
+    if ADDRESS_COLUMN not in df.columns:
+        raise ValueError(
+            f"Не знайдена колонка '{ADDRESS_COLUMN}'"
+        )
+
+    has_reference = (
+        REFERENCE_LAT_COLUMN in df.columns
+        and REFERENCE_LON_COLUMN in df.columns
+    )
+
+    results = []
+
+    total = len(df)
+
+    for index, row in df.iterrows():
+
+        address = row[ADDRESS_COLUMN]
+
+        if pd.isna(address):
+            continue
+
+        print(
+            f"[{index + 1}/{total}] {address}"
+        )
+
+        ref_lat = None
+        ref_lon = None
+
+        if has_reference:
+
+            ref_lat = row[
+                REFERENCE_LAT_COLUMN
+            ]
+
+            ref_lon = row[
+                REFERENCE_LON_COLUMN
+            ]
+
+        result = process_address(
+            address,
+            ref_lat,
+            ref_lon
+        )
+
+        results.append(result)
+
+    result_df = pd.DataFrame(results)
+
+    summary_df = create_provider_summary(
+        result_df
+    )
+
+    # --------------------------------------------------------
+    # AGREEMENT SUMMARY
+    # --------------------------------------------------------
+
+    if "agreement" in result_df.columns:
+
+        agreement_summary = (
+            result_df["agreement"]
+            .value_counts(dropna=False)
+            .reset_index()
+        )
+
+        agreement_summary.columns = [
+            "agreement",
+            "count"
+        ]
+
+    else:
+
+        agreement_summary = pd.DataFrame()
+
+    # --------------------------------------------------------
+    # EXCEL
+    # --------------------------------------------------------
+
+    OUTPUT_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with pd.ExcelWriter(
+        OUTPUT_FILE,
+        engine="openpyxl"
+    ) as writer:
+
+        result_df.to_excel(
+            writer,
+            sheet_name="results",
+            index=False
+        )
+
+        summary_df.to_excel(
+            writer,
+            sheet_name="provider_summary",
+            index=False
+        )
+
+        agreement_summary.to_excel(
+            writer,
+            sheet_name="agreement_summary",
+            index=False
+        )
+
+    print()
+    print("ГОТОВО")
+    print(OUTPUT_FILE)
+
+    print()
+    print("Рейтинг провайдерів:")
+    print(summary_df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
